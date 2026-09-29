@@ -1,0 +1,214 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Aether — Hand Gesture Music</title>
+<style>
+:root{--bg:#0b0b14;--fg:#eceaff;--mut:#8a87b0;--acc:#7c5cff;--acc2:#00e0c6;--card:#15152600;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}
+@media (prefers-color-scheme:light){:root:not([data-theme="dark"]){--bg:#f3f1ff;--fg:#1a1836;--mut:#6b688f}}
+:root[data-theme="dark"]{--bg:#0b0b14;--fg:#eceaff;--mut:#8a87b0}
+:root[data-theme="light"]{--bg:#f3f1ff;--fg:#1a1836;--mut:#6b688f}
+*{box-sizing:border-box}html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,sans-serif;display:flex;flex-direction:column;align-items:center;padding:12px;gap:10px}
+h1{margin:0;font-size:1.3rem;letter-spacing:.1em;background:linear-gradient(90deg,var(--acc),var(--acc2));-webkit-background-clip:text;background-clip:text;color:transparent}
+#stage{position:relative;width:100%;max-width:820px;aspect-ratio:4/3;max-height:58vh;border-radius:16px;overflow:hidden;background:#000;border:1px solid #ffffff22}
+canvas{width:100%;height:100%;display:block;touch-action:none}
+#status{font-size:.85rem;color:var(--mut);text-align:center;min-height:1.2em}
+.row{display:flex;gap:8px;flex-wrap:wrap;justify-content:center}
+button{background:var(--acc);color:#fff;border:0;border-radius:10px;padding:10px 16px;font-size:.95rem;cursor:pointer}
+button.alt{background:transparent;border:1px solid var(--mut);color:var(--fg)}
+.meters{display:flex;gap:14px;flex-wrap:wrap;justify-content:center;font-size:.8rem;color:var(--mut)}
+.meters b{color:var(--fg)}
+.guide{max-width:820px;width:100%;display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:10px;font-size:.85rem;color:var(--mut)}
+.guide div{border:1px solid #8a87b044;border-radius:12px;padding:10px}
+.guide h3{margin:0 0 4px;color:var(--fg);font-size:.9rem}
+</style></head>
+<body>
+<h1>AETHER</h1>
+<div id="stage"><canvas id="cv" width="800" height="600"></canvas></div>
+<div id="status">Press Start, allow camera access, and raise your hands.</div>
+<div class="row">
+<button id="start">Start</button>
+<button id="beat" class="alt">Beat: off</button>
+<button id="mouse" class="alt">Mouse mode</button>
+</div>
+<div class="meters"><span>Note <b id="mNote">–</b></span><span>Tone <b id="mTone">–</b></span><span>Tempo <b id="mBpm">96</b> BPM</span><span>Hands <b id="mHands">0</b></span></div>
+<div class="guide">
+<div><h3>✋ Melody hand (right side of screen)</h3>Move left↔right to pick a note (A minor pentatonic). Move up↔down to open the filter (brighter). <b>Pinch</b> thumb + index to play; release to fade.</div>
+<div><h3>🖐 Rhythm hand (left side of screen)</h3>Open palm starts the beat, <b>fist</b> stops it. Raise or lower your hand to change tempo (60–160 BPM).</div>
+<div><h3>🖱 Mouse mode</h3>Move for note and tone, hold click to play. Use the Beat button for drums.</div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/hands.js" crossorigin="anonymous"></script>
+<script>
+const $=id=>document.getElementById(id);
+const cv=$('cv'),g=cv.getContext('2d'),W=cv.width,H=cv.height;
+const SCALE=[0,3,5,7,10,12,15,17,19,22].map(n=>57+n);
+const NAMES=['C','C#','D','D#','E','F','F#','G','G#','A','A#','B'];
+const mf=m=>440*Math.pow(2,(m-69)/12);
+let ac,master,osc,filt,gain,beatOn=false,bpm=96,step=0,timer=null,mouseMode=false;
+let melody={active:false,x:.5,y:.5},rhythm={fist:false,y:.5,seen:false};
+let video=null,hands=null,landmarks=[],camOk=false;
+
+function initAudio(){
+  if(ac)return;
+  ac=new (window.AudioContext||window.webkitAudioContext)();
+  master=ac.createGain();master.gain.value=.7;
+  const dly=ac.createDelay();dly.delayTime.value=.3;
+  const fb=ac.createGain();fb.gain.value=.35;
+  const wet=ac.createGain();wet.gain.value=.3;
+  dly.connect(fb);fb.connect(dly);dly.connect(wet);wet.connect(ac.destination);
+  master.connect(ac.destination);master.connect(dly);
+  filt=ac.createBiquadFilter();filt.type='lowpass';filt.frequency.value=800;filt.Q.value=6;
+  gain=ac.createGain();gain.gain.value=0;
+  osc=ac.createOscillator();osc.type='sawtooth';osc.frequency.value=mf(SCALE[0]);
+  const o2=ac.createOscillator();o2.type='square';o2.detune.value=8;o2.frequency.value=mf(SCALE[0]);
+  osc._o2=o2;
+  const o2g=ac.createGain();o2g.gain.value=.4;
+  osc.connect(filt);o2.connect(o2g);o2g.connect(filt);
+  filt.connect(gain);gain.connect(master);
+  osc.start();o2.start();
+  // soft pad drone (A minor: A2 C3 E3)
+  [45,48,52].forEach((m,i)=>{
+    const o=ac.createOscillator();o.type='sine';o.frequency.value=mf(m);o.detune.value=i*4;
+    const pg=ac.createGain();pg.gain.value=.06;o.connect(pg);pg.connect(master);o.start();
+  });
+}
+function kick(t){
+  const o=ac.createOscillator(),gn=ac.createGain();
+  o.frequency.setValueAtTime(150,t);o.frequency.exponentialRampToValueAtTime(40,t+.15);
+  gn.gain.setValueAtTime(.9,t);gn.gain.exponentialRampToValueAtTime(.001,t+.25);
+  o.connect(gn);gn.connect(master);o.start(t);o.stop(t+.3);
+}
+function hat(t,v){
+  const len=ac.sampleRate*.05,buf=ac.createBuffer(1,len,ac.sampleRate),d=buf.getChannelData(0);
+  for(let i=0;i<len;i++)d[i]=(Math.random()*2-1)*(1-i/len);
+  const s=ac.createBufferSource();s.buffer=buf;
+  const hp=ac.createBiquadFilter();hp.type='highpass';hp.frequency.value=7000;
+  const gn=ac.createGain();gn.gain.value=v;
+  s.connect(hp);hp.connect(gn);gn.connect(master);s.start(t);
+}
+function tick(){
+  if(!beatOn)return;
+  const t=ac.currentTime+.02;
+  if(step%4===0)kick(t);
+  if(step%2===1)hat(t,.25);else hat(t,.1);
+  step=(step+1)%16;
+  timer=setTimeout(tick,60000/bpm/4);
+}
+function setBeat(on){
+  initAudio();ac.resume();
+  if(on===beatOn)return;
+  beatOn=on;$('beat').textContent='Beat: '+(on?'on':'off');
+  clearTimeout(timer);if(on){step=0;tick();}
+}
+function updateSound(){
+  if(!ac)return;
+  const t=ac.currentTime;
+  const idx=Math.max(0,Math.min(SCALE.length-1,Math.floor(melody.x*SCALE.length)));
+  const m=SCALE[idx],f=mf(m);
+  osc.frequency.setTargetAtTime(f,t,.02);osc._o2.frequency.setTargetAtTime(f,t,.02);
+  const cut=200+Math.pow(1-melody.y,2)*5000;
+  filt.frequency.setTargetAtTime(cut,t,.03);
+  gain.gain.setTargetAtTime(melody.active?.35:0,t,melody.active?.02:.25);
+  $('mNote').textContent=NAMES[m%12]+(Math.floor(m/12)-1);
+  $('mTone').textContent=Math.round((1-melody.y)*100)+'%';
+  $('mBpm').textContent=Math.round(bpm);
+}
+
+// ---- hand tracking ----
+const d2=(a,b)=>Math.hypot(a.x-b.x,a.y-b.y);
+function onResults(res){
+  landmarks=res.multiHandLandmarks||[];
+  $('mHands').textContent=landmarks.length;
+  let gotM=false,gotR=false;
+  for(const lm of landmarks){
+    const size=d2(lm[0],lm[9])||.1;
+    const mx=1-lm[0].x; // mirrored
+    if(mx>=.5){ // melody hand
+      gotM=true;
+      const pinch=d2(lm[4],lm[8])/size;
+      melody.active=pinch<.45;
+      melody.x=(mx-.5)*2;
+      melody.y=lm[9].y;
+    }else{ // rhythm hand
+      gotR=true;
+      const tips=[8,12,16,20].reduce((s,i)=>s+d2(lm[i],lm[0]),0)/4/size;
+      const fist=tips<1.25;
+      rhythm.y=lm[9].y;
+      bpm=60+(1-Math.min(1,Math.max(0,(rhythm.y-.1)/.8)))*100;
+      if(fist&&beatOn)setBeat(false);
+      if(!fist&&!beatOn&&tips>1.7)setBeat(true);
+    }
+  }
+  if(!gotM)melody.active=false;
+  updateSound();
+}
+async function startCamera(){
+  try{
+    if(typeof Hands==='undefined')throw new Error('tracker script blocked');
+    const stream=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480,facingMode:'user'}});
+    video=document.createElement('video');video.playsInline=true;video.muted=true;video.srcObject=stream;await video.play();
+    $('status').textContent='Loading hand-tracking model…';
+    hands=new Hands({locateFile:f=>'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/'+f});
+    hands.setOptions({maxNumHands:2,modelComplexity:0,minDetectionConfidence:.6,minTrackingConfidence:.5});
+    hands.onResults(r=>{camOk=true;$('status').textContent='Tracking live — pinch on the right side to play.';onResults(r);});
+    const loop=async()=>{try{await hands.send({image:video});}catch(e){fail(e);return;}requestAnimationFrame(loop);};
+    loop();
+    setTimeout(()=>{if(!camOk)fail(new Error('model did not load'));},12000);
+  }catch(e){fail(e);}
+}
+function fail(e){
+  if(camOk)return;
+  console.warn(e);
+  $('status').textContent='Camera/tracker unavailable here ('+(e.message||e)+'). Using mouse mode instead.';
+  setMouse(true);
+}
+
+// ---- mouse fallback ----
+function setMouse(on){
+  mouseMode=on;$('mouse').textContent='Mouse mode: '+(on?'on':'off');
+}
+function mpos(e){const r=cv.getBoundingClientRect();return{x:(e.clientX-r.left)/r.width,y:(e.clientY-r.top)/r.height};}
+cv.addEventListener('pointermove',e=>{if(!mouseMode)return;const p=mpos(e);melody.x=p.x;melody.y=p.y;updateSound();});
+cv.addEventListener('pointerdown',e=>{if(!mouseMode)return;initAudio();ac.resume();const p=mpos(e);melody.x=p.x;melody.y=p.y;melody.active=true;updateSound();});
+addEventListener('pointerup',()=>{if(mouseMode){melody.active=false;updateSound();}});
+
+// ---- drawing ----
+const CONN=[[0,1],[1,2],[2,3],[3,4],[0,5],[5,6],[6,7],[7,8],[5,9],[9,10],[10,11],[11,12],[9,13],[13,14],[14,15],[15,16],[13,17],[17,18],[18,19],[19,20],[0,17]];
+function draw(){
+  g.fillStyle='#07070f';g.fillRect(0,0,W,H);
+  if(video&&camOk){g.save();g.translate(W,0);g.scale(-1,1);g.globalAlpha=.55;g.drawImage(video,0,0,W,H);g.restore();g.globalAlpha=1;}
+  // zones
+  g.fillStyle='#7c5cff14';g.fillRect(W/2,0,W/2,H);
+  g.fillStyle='#ffffffaa';g.font='16px system-ui';
+  g.fillText('RHYTHM',16,28);g.fillText('MELODY',W-96,28);
+  if(!mouseMode||camOk){
+    // note lanes on right half
+    g.strokeStyle='#ffffff18';
+    for(let i=0;i<=SCALE.length;i++){const x=W/2+i*(W/2)/SCALE.length;g.beginPath();g.moveTo(x,0);g.lineTo(x,H);g.stroke();}
+  }
+  for(const lm of landmarks){
+    const mel=(1-lm[0].x)>=.5;
+    g.strokeStyle=mel?'#00e0c6':'#ff7ac6';g.lineWidth=3;
+    for(const[a,b]of CONN){g.beginPath();g.moveTo((1-lm[a].x)*W,lm[a].y*H);g.lineTo((1-lm[b].x)*W,lm[b].y*H);g.stroke();}
+    g.fillStyle='#fff';
+    for(const p of lm){g.beginPath();g.arc((1-p.x)*W,p.y*H,3.5,0,7);g.fill();}
+  }
+  if(mouseMode&&!landmarks.length){
+    const x=melody.x*W,y=melody.y*H;
+    g.fillStyle=melody.active?'#00e0c6':'#7c5cff88';g.beginPath();g.arc(x,y,melody.active?26:16,0,7);g.fill();
+  }
+  if(melody.active&&landmarks.length){
+    const lm=landmarks.find(l=>(1-l[0].x)>=.5);
+    if(lm){g.fillStyle='#00e0c6aa';g.beginPath();g.arc((1-lm[8].x)*W,lm[8].y*H,22,0,7);g.fill();}
+  }
+  if(beatOn){g.fillStyle='#ff7ac6';g.fillRect(0,H-6,W*((step%16)/16),6);}
+  requestAnimationFrame(draw);
+}
+draw();
+
+$('start').onclick=()=>{initAudio();ac.resume();$('start').textContent='Restart camera';$('status').textContent='Requesting camera…';startCamera();};
+$('beat').onclick=()=>setBeat(!beatOn);
+$('mouse').onclick=()=>{setMouse(!mouseMode);initAudio();};
+</script>
+</body></html>
